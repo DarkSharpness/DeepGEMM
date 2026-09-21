@@ -303,10 +303,20 @@ struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen> {
         return (cur.q_token_start == end_q_token_idx) ? end_kv_split_idx : cur.num_kv_splits;
     }
 
+    // Valid KV length of one logits row: 2D / varlen layouts carry one length per token,
+    // the 1D layout is causal inside the request's last `kNextN` tokens
+    CUTLASS_DEVICE uint32_t get_row_context_len(const uint32_t& row) const {
+        if constexpr (kIsContextLens2D or kIsVarlen)
+            return context_lens[row];
+        const auto context_len = context_lens[row / kNextN];
+        return context_len + 1 + row % kNextN - cute::min(context_len + 1, kNextN);
+    }
+
     // Emit the next (Q-block, chunk) task and stash its addressing geometry
-    template <bool kIsCompressedLogits = false>
+    // `kLoadSeqBounds` also fills per-row `[0, context_len)` bounds (row statistics)
+    template <bool kLoadSeqBounds = false>
     CUTLASS_DEVICE bool next_q_block(uint32_t& q_block_idx, uint32_t& kv_split_base, uint32_t& num_kv_splits,
-                                     uint32_t* = nullptr, uint32_t* = nullptr) {
+                                     uint32_t* seq_k_start = nullptr, uint32_t* seq_k_end = nullptr) {
         q_block_idx = 0;  // addressing uses stashed state
         if (done)
             return false;
@@ -319,6 +329,15 @@ struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen> {
         cur_q_block_token_base = cur.q_token_start + q_block_token_offset;
         cur_num_block_tokens = q_block_num_tokens;
         cur_request_num_kv_pages = cur.num_kv_pages;
+        if constexpr (kLoadSeqBounds) {
+            // Rows past this block's valid tokens are clamped onto the last valid row
+            #pragma unroll
+            for (uint32_t token_idx = 0; token_idx < BLOCK_Q; ++ token_idx) {
+                const auto row = cur_q_block_token_base + cute::min(token_idx, cur_num_block_tokens - 1);
+                seq_k_start[token_idx] = 0;
+                seq_k_end[token_idx] = get_row_context_len(row);
+            }
+        }
         kv_split_base = cur_kv_split_base;
         const uint32_t remaining = upper - cur_kv_split_base;   // upper > cur_kv_split_base (guarded by `done`)
         num_kv_splits = (cur.num_q_blocks == 1) ? remaining

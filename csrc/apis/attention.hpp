@@ -82,6 +82,24 @@ static void fp8_gemm_nt_skip_head_mid(const std::pair<torch::Tensor, torch::Tens
     }
 }
 
+// Optional per-row logits statistics: FP32 `[num_rows, 2]` view (sum, sum of squares) over each
+// row's valid KV range, accumulated with relaxed reductions, so the caller must zero it. The row
+// stride may be larger than 2 (e.g. a `[num_rows, 8]` buffer viewed as `[:, :2]`) to give every
+// row its own 32-byte L2 sector. SM100 only, not combinable with `clean_logits`.
+static void check_mqa_logits_row_stats(const std::optional<torch::Tensor>& row_stats,
+                                       const int& num_rows, const torch::Device& device) {
+    if (not row_stats.has_value())
+        return;
+    const auto& stats = row_stats.value();
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+    DG_HOST_ASSERT(stats.is_cuda() and stats.device() == device);
+    DG_HOST_ASSERT(stats.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(stats.dim() == 2 and stats.size(0) == num_rows and stats.size(1) == 2);
+    DG_HOST_ASSERT(stats.stride(1) == 1 and stats.stride(0) >= 2 and stats.stride(0) % 2 == 0);
+    // Each row's pair is reduced as two adjacent words; keep 8-byte alignment
+    DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(stats.data_ptr()) % 8 == 0);
+}
+
 static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::optional<torch::Tensor>>& q,
                                         const std::tuple<torch::Tensor, torch::Tensor>& kv,
                                         const torch::Tensor& weights,
@@ -90,7 +108,8 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
                                         const bool& clean_logits,
                                         const int& max_seqlen_k,
                                         const at::ScalarType& logits_dtype,
-                                        const std::optional<torch::Tensor>& schedule_meta = std::nullopt) {
+                                        const std::optional<torch::Tensor>& schedule_meta = std::nullopt,
+                                        const std::optional<torch::Tensor>& row_stats = std::nullopt) {
     const auto [q_fp, q_sf] = q;
     const auto [kv_fp, kv_sf] = kv;
     const auto qk_dtype = q_fp.scalar_type();
@@ -145,6 +164,10 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     DG_HOST_ASSERT(cu_seq_len_k_end.is_contiguous());
     DG_HOST_ASSERT(cu_seq_len_k_end.scalar_type() == torch::kInt);
 
+    // Check row statistics (they reuse the in-kernel cleaner warp, so no cleaning alongside)
+    DG_HOST_ASSERT(not (row_stats.has_value() and clean_logits));
+    check_mqa_logits_row_stats(row_stats, seq_len, q_fp.device());
+
     // Allocate output
     DG_HOST_ASSERT(num_heads > 0 and num_heads <= 128 and num_heads % 4 == 0);
     const int block_kv = arch_major == 12 ? 128 : 256;
@@ -189,7 +212,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
             (legacy_fp8_cleanup or long_mx_cleanup or long_legacy_h8_cleanup);
         sm100_mqa_logits(q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
                          seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv,
-                         clean_logits and not separate_cleanup, is_mx_sf, qk_dtype, schedule_meta);
+                         clean_logits and not separate_cleanup, is_mx_sf, qk_dtype, schedule_meta, row_stats);
         if (separate_cleanup)
             smxx_clean_logits(logits, cu_seq_len_k_start, cu_seq_len_k_end, 1, seq_len, seq_len_kv, stride_logits);
     } else if (arch_major == 12) {
@@ -458,7 +481,8 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
                                               const int& max_context_len,
                                               const bool& clean_logits,
                                               const at::ScalarType& logits_dtype,
-                                              const std::optional<torch::Tensor>& indices) {
+                                              const std::optional<torch::Tensor>& indices,
+                                              const std::optional<torch::Tensor>& row_stats = std::nullopt) {
     const auto [q_fp, q_sf] = q;
     const auto qk_dtype = q_fp.scalar_type();
     const bool is_fp4 = qk_dtype == kPackedFP4;
@@ -547,6 +571,9 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
     DG_HOST_ASSERT(schedule_meta.is_contiguous());
     DG_HOST_ASSERT(schedule_meta.scalar_type() == torch::kInt);
 
+    // Check row statistics
+    check_mqa_logits_row_stats(row_stats, batch_size * next_n, q_fp.device());
+
     // Check context lengths
     // NOTES: Only 2D context lens is supported for now
     DG_HOST_ASSERT(context_lens.dim() == 2);
@@ -572,7 +599,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         sm100_paged_mqa_logits(q_fp, q_sf, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
                                logits_dtype, batch_size, batch_size * next_n, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
                                is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv, splits_per_chunk,
-                               is_mx_sf, qk_dtype);
+                               is_mx_sf, qk_dtype, row_stats);
     } else if (arch_major == 12) {
         DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn or qk_dtype == kPackedFP4);
         DG_HOST_ASSERT(num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64);
@@ -602,10 +629,11 @@ static torch::Tensor fp8_mqa_logits(const torch::Tensor& q,
                                     const torch::Tensor& cu_seq_len_k_start,
                                     const torch::Tensor& cu_seq_len_k_end,
                                     const bool& clean_logits,
-                                    const int& max_seqlen_k) {
+                                    const int& max_seqlen_k,
+                                    const std::optional<torch::Tensor>& row_stats = std::nullopt) {
     return fp8_fp4_mqa_logits(std::make_tuple(q, std::nullopt), kv, weights,
                               cu_seq_len_k_start, cu_seq_len_k_end,
-                              clean_logits, max_seqlen_k, torch::kFloat);
+                              clean_logits, max_seqlen_k, torch::kFloat, std::nullopt, row_stats);
 }
 
 static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
@@ -616,10 +644,11 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
                                           const torch::Tensor& schedule_meta,
                                           const int& max_context_len,
                                           const bool& clean_logits,
-                                          const std::optional<torch::Tensor>& indices) {
+                                          const std::optional<torch::Tensor>& indices,
+                                          const std::optional<torch::Tensor>& row_stats = std::nullopt) {
     return fp8_fp4_paged_mqa_logits(std::make_tuple(q, std::nullopt), fused_kv_cache, weights,
                                     context_lens, block_table, schedule_meta,
-                                    max_context_len, clean_logits, torch::kFloat, indices);
+                                    max_context_len, clean_logits, torch::kFloat, indices, row_stats);
 }
 #ifndef DG_USE_TVM_FFI
 
@@ -635,7 +664,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("clean_logits") = true,
           py::arg("max_seqlen_k") = 0,
           py::arg("logits_dtype") = torch::kFloat32,
-          py::arg("schedule_meta") = std::nullopt);
+          py::arg("schedule_meta") = std::nullopt,
+          py::arg("row_stats") = std::nullopt);
     m.def("get_mqa_logits_metadata", &get_mqa_logits_metadata,
           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
           py::arg("num_kv_tokens"), py::arg("num_heads"));
@@ -662,18 +692,21 @@ static void register_apis(pybind11::module_& m) {
           py::arg("max_context_len"),
           py::arg("clean_logits") = false,
           py::arg("logits_dtype") = torch::kFloat32,
-          py::arg("indices") = std::nullopt);
+          py::arg("indices") = std::nullopt,
+          py::arg("row_stats") = std::nullopt);
     // Legacy API
     m.def("fp8_mqa_logits", &fp8_mqa_logits,
           py::arg("q"), py::arg("kv"), py::arg("weights"),
           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
           py::arg("clean_logits") = true,
-          py::arg("max_seqlen_k") = 0);
+          py::arg("max_seqlen_k") = 0,
+          py::arg("row_stats") = std::nullopt);
     m.def("fp8_paged_mqa_logits", &fp8_paged_mqa_logits,
           py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
           py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
           py::arg("max_context_len"), py::arg("clean_logits") = false,
-          py::arg("indices") = std::nullopt);
+          py::arg("indices") = std::nullopt,
+          py::arg("row_stats") = std::nullopt);
 }
 
 #endif

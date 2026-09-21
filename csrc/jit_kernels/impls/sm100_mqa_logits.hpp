@@ -113,7 +113,8 @@ static int get_mqa_logits_smem_size(const int& num_heads, const int& head_dim,
                                     const at::ScalarType& weights_dtype,
                                     const int& block_q, const int& split_kv,
                                     const int& num_q_stages, const int& num_kv_stages,
-                                    const int& num_tmem_stages) {
+                                    const int& num_tmem_stages,
+                                    const bool& with_row_stats = false, const int& num_math_warps = 8) {
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
@@ -141,7 +142,20 @@ static int get_mqa_logits_smem_size(const int& num_heads, const int& head_dim,
     const uint32_t num_barriers = 2 * (num_q_stages + num_kv_stages + num_tmem_stages);
     add_region(num_barriers * sizeof(Barrier), alignof(Barrier));
     add_region(sizeof(uint32_t), alignof(uint32_t));
+    num_smem_bytes = math::align(num_smem_bytes, swizzle_alignment);
+    if (with_row_stats) {
+        // Mirrors `epilogue::RowStatsSharedStorage`: `float2 [q_stages][math_warps][block_q]`
+        add_region(num_q_stages * num_math_warps * block_q * sizeof(float2), alignof(float2));
+    }
     return static_cast<int>(math::align(num_smem_bytes, swizzle_alignment));
+}
+
+// Device-side expression for the optional statistics region, used by the JIT static assertion
+static std::string get_row_stats_smem_expr(const bool& with_row_stats, const int& num_q_stages,
+                                           const int& num_math_warps, const int& block_q) {
+    if (not with_row_stats)
+        return "0u";
+    return std::format("epilogue::get_row_stats_smem_size<{}, {}, {}>()", num_q_stages, num_math_warps, block_q);
 }
 
 // Unified contiguous-KV runtime for FP8 / MXFP4 / MXFP8; FP8 reuses the unused `sf_q` descriptor slot
@@ -159,8 +173,12 @@ static void sm100_mqa_logits(const torch::Tensor& q, const std::optional<torch::
                              const bool& clean_logits,
                              const bool& is_mx_sf,
                              const at::ScalarType& qk_dtype,
-                             const std::optional<torch::Tensor>& schedule_meta) {
+                             const std::optional<torch::Tensor>& schedule_meta,
+                             const std::optional<torch::Tensor>& row_stats) {
     const bool is_fp4 = qk_dtype == kPackedFP4;
+    float* row_stats_ptr = row_stats.has_value() ? row_stats.value().data_ptr<float>() : nullptr;
+    const uint32_t row_stats_stride = row_stats.has_value() ? static_cast<uint32_t>(row_stats.value().stride(0)) : 0;
+    DG_HOST_ASSERT(not (row_stats.has_value() and clean_logits));
 
     constexpr int num_specialized_threads = 128;
     const int num_math_threads = 2 * 128;
@@ -219,11 +237,13 @@ static void sm100_mqa_logits(const torch::Tensor& q, const std::optional<torch::
 
     const int smem_size = get_mqa_logits_smem_size(
         num_heads, head_dim, is_mx_sf, qk_dtype, weights.scalar_type(),
-        block_q, split_kv, num_q_stages, num_kv_stages, 3);
+        block_q, split_kv, num_q_stages, num_kv_stages, 3,
+        row_stats.has_value(), num_math_threads / 32);
     DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
 
     const bool full_span_unroll = num_heads == 8 and weights.scalar_type() == torch::kBFloat16 and
         not clean_logits and not is_compressed_logits and not schedule_meta.has_value() and
+        not row_stats.has_value() and
         num_q_tokens >= 2048 and num_kv_tokens >= 65536 and
         (not is_mx_sf or (is_fp4 and head_dim == 64) or
             (is_mx_sf and not is_fp4 and (head_dim == 32 or head_dim == 128)));
@@ -234,15 +254,17 @@ static void sm100_mqa_logits(const torch::Tensor& q, const std::optional<torch::
 
 using namespace deep_gemm;
 
-static_assert(sizeof(layout::MQALogitsSharedStorage<
+using SharedStorage = layout::MQALogitsSharedStorage<
     {}, {}, {}, {}, {}, {}, {}, 3, {}, {}
->) == {}, "Incorrect MQA logits shared-memory size");
+>;
+static_assert(math::constexpr_align(static_cast<uint32_t>(sizeof(SharedStorage)) + {}, SharedStorage::kSwizzleAlignment) == {},
+              "Incorrect MQA logits shared-memory size");
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&{}<
         {}, {},
         {},
-        {}, {}, {},
+        {}, {}, {}, {},
         {}, {},
         {}, {},
         {},
@@ -256,11 +278,11 @@ static void __instantiate_kernel() {{
     block_q, split_kv, num_q_stages, num_kv_stages,
     qk_dtype == kPackedFP4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t",
     weights.scalar_type() == torch::kBFloat16 ? "__nv_bfloat16" : "float",
-    smem_size,
+    get_row_stats_smem_expr(row_stats.has_value(), num_q_stages, num_math_threads / 32, block_q), smem_size,
     full_span_unroll ? "sm100_mqa_logits_unrolled" : "sm100_mqa_logits",
     num_heads, head_dim,
     is_mx_sf ? "true" : "false",
-    is_compressed_logits, clean_logits,
+    is_compressed_logits, clean_logits, row_stats.has_value(),
     schedule_meta.has_value(),
     block_q, split_kv,
     num_q_stages, num_kv_stages,
@@ -281,7 +303,7 @@ static void __instantiate_kernel() {{
         stride_logits,
         cu_seq_len_k_start.data_ptr<int>(), cu_seq_len_k_end.data_ptr<int>(),
         schedule_meta.has_value() ? schedule_meta.value().data_ptr<int>() : nullptr,
-        logits.data_ptr(),
+        logits.data_ptr(), row_stats_ptr, row_stats_stride,
         tensor_map_q, tensor_map_sf_q,
         tensor_map_kv, tensor_map_sf_kv,
         tensor_map_weights
@@ -314,8 +336,11 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
                                    const int& split_kv,
                                    const int& splits_per_chunk,
                                    const bool& is_mx_sf,
-                                   const at::ScalarType& qk_dtype) {
+                                   const at::ScalarType& qk_dtype,
+                                   const std::optional<torch::Tensor>& row_stats) {
     const bool is_fp4 = qk_dtype == kPackedFP4;
+    float* row_stats_ptr = row_stats.has_value() ? row_stats.value().data_ptr<float>() : nullptr;
+    const uint32_t row_stats_stride = row_stats.has_value() ? static_cast<uint32_t>(row_stats.value().stride(0)) : 0;
 
     const int num_specialized_threads = 128;
     const int num_math_threads = 2 * 128;
@@ -364,7 +389,8 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
 
     const int smem_size = get_mqa_logits_smem_size(
         num_heads, head_dim, is_mx_sf, qk_dtype, weights.scalar_type(),
-        block_q, split_kv, num_q_stages, num_kv_stages, 3);
+        block_q, split_kv, num_q_stages, num_kv_stages, 3,
+        row_stats.has_value(), num_math_threads / 32);
     DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
 
     // Compile
@@ -373,15 +399,17 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
 
 using namespace deep_gemm;
 
-static_assert(sizeof(layout::MQALogitsSharedStorage<
+using SharedStorage = layout::MQALogitsSharedStorage<
     {}, {}, {}, {}, {}, {}, {}, 3, {}, {}
->) == {}, "Incorrect MQA logits shared-memory size");
+>;
+static_assert(math::constexpr_align(static_cast<uint32_t>(sizeof(SharedStorage)) + {}, SharedStorage::kSwizzleAlignment) == {},
+              "Incorrect MQA logits shared-memory size");
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm100_paged_mqa_logits<
         {}, {},
         {}, {},
-        {}, {}, {},
+        {}, {}, {}, {},
         {}, {},
         {}, {},
         {}, {},
@@ -393,11 +421,11 @@ static void __instantiate_kernel() {{
     block_q, split_kv, num_q_stages, num_kv_stages,
     qk_dtype == kPackedFP4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t",
     weights.scalar_type() == torch::kBFloat16 ? "__nv_bfloat16" : "float",
-    smem_size,
+    get_row_stats_smem_expr(row_stats.has_value(), num_q_stages, num_math_threads / 32, block_q), smem_size,
     tokens_per_request, num_heads,
     head_dim, page_kv,
     is_mx_sf ? "true" : "false",
-    is_context_lens_2d, is_varlen ? "true" : "false",
+    is_context_lens_2d, is_varlen ? "true" : "false", row_stats.has_value(),
     num_q_stages, num_kv_stages,
     split_kv, splits_per_chunk,
     num_specialized_threads, num_math_threads,
@@ -414,7 +442,7 @@ static void __instantiate_kernel() {{
         },
         num_q_tokens_total,
         logits_stride, block_table_stride,
-        context_lens.data_ptr<int>(), logits.data_ptr(),
+        context_lens.data_ptr<int>(), logits.data_ptr(), row_stats_ptr, row_stats_stride,
         block_table.data_ptr<int>(), is_varlen ? indices.data_ptr<int>() : nullptr, schedule_meta.data_ptr<int>(),
         tensor_map_q, tensor_map_sf_q,
         tensor_map_kv, tensor_map_sf_kv,

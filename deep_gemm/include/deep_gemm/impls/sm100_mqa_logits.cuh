@@ -11,6 +11,7 @@
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/epilogue/clean_logits.cuh>
+#include <deep_gemm/epilogue/row_stats.cuh>
 #include <deep_gemm/layout/mqa_logits.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
@@ -80,7 +81,7 @@ CUTLASS_DEVICE WarpIdx get_mqa_math_warp_idx(const WarpIdx& warp_idx) {
 
 // Shared device core parameterized by dtype and scheduler geometry/addressing
 template <uint32_t kNumHeads, uint32_t kHeadDim,
-          bool kIsMXSF, bool kIsCompressedLogits, bool kCleanLogits,
+          bool kIsMXSF, bool kIsCompressedLogits, bool kCleanLogits, bool kRowStats,
           uint32_t BLOCK_Q, uint32_t SPLIT_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumSMs,
@@ -89,6 +90,8 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
 CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                                                logits_dtype_t* logits,
+                                               float* row_stats, const uint32_t row_stats_stride,
+                                               const uint32_t num_row_stats_rows,
                                                const cute::TmaDescriptor& tensor_map_q,
                                                const cute::TmaDescriptor& tensor_map_sf_q,
                                                const cute::TmaDescriptor& tensor_map_kv,
@@ -142,11 +145,17 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     DG_STATIC_ASSERT(kNumSpecializedThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
     DG_STATIC_ASSERT(SPLIT_KV == kNumMathWarpGroups * UMMA_M and SPLIT_KV % kNumUTCCPAlignedElems == 0, "Invalid `SPLIT_KV`");
     DG_STATIC_ASSERT(not (kIsCompressedLogits and kCleanLogits), "Compressed logits cannot be cleaned in-kernel");
+    // Row statistics reuse the logits-cleaner warp, so the two are mutually exclusive
+    DG_STATIC_ASSERT(not (kRowStats and kCleanLogits), "Row statistics cannot be combined with in-kernel cleaning");
 
     using SharedStorage = layout::MQALogitsSharedStorage<kNumHeads, kHeadDim, kIsMXSF, BLOCK_Q, SPLIT_KV,
                                                          kNumQStages, kNumKVStages, kNumTmemStages, qk_dtype_t, reduce_dtype_t>;
     extern __shared__ __align__(SharedStorage::kSwizzleAlignment) uint8_t smem_buffer[];
     auto& smem = *reinterpret_cast<SharedStorage*>(smem_buffer);
+    // Statistics partials live right after the main storage (only allocated when statistics are on)
+    constexpr uint32_t kNumMathWarps = kNumMathThreads / 32;
+    using RowStatsStorage = epilogue::RowStatsSharedStorage<kNumQStages, kNumMathWarps, BLOCK_Q>;
+    auto& row_stats_smem = *reinterpret_cast<RowStatsStorage*>(smem_buffer + sizeof(SharedStorage));
 
     constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumTmemStages;
     constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols + kNumSFQ / 32 + kNumSFKV / 32>();
@@ -194,25 +203,114 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
     if (warp_idx == kSpecWarpStart) {
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
-        if (cute::elect_one_sync()) {
+        if constexpr (not kRowStats) {
+            if (cute::elect_one_sync()) {
+                auto scheduler = make_scheduler(kReuseSchedulerIndex ? sm_idx : uint32_t(blockIdx.x));
+                // NOTES: split index for paged scheduler, token offset for contiguous-KV scheduler.
+                uint32_t q_block_idx, kv_base, num_kv_splits;
+                while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
+                    CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
+                    smem.empty_q_barriers[q_stage_idx].wait(q_phase ^ 1);
+
+                    const uint32_t q_token_base = scheduler.get_q_tma_token_base(q_block_idx);
+                    tma::copy<kHeadDim, BLOCK_Q * kNumHeads, 0>(
+                        &tensor_map_q, &smem.full_q_barriers[q_stage_idx],
+                        smem.smem_q[q_stage_idx], 0, q_token_base * kNumHeads);
+                    if constexpr (kIsMXSF)
+                        tma::copy<BLOCK_Q * kNumHeads, 1, 0>(&tensor_map_sf_q, &smem.full_q_barriers[q_stage_idx], smem.smem_sf_q[q_stage_idx], 0, q_token_base);
+                    tma::copy<kNumWeightElementsPerRow, BLOCK_Q, 0>(&tensor_map_weights, &smem.full_q_barriers[q_stage_idx], smem.smem_weights[q_stage_idx], 0, q_token_base);
+                    smem.full_q_barriers[q_stage_idx].arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE + SMEM_SF_Q_SIZE_PER_STAGE + SMEM_WEIGHT_SIZE_PER_STAGE);
+                }
+            }
+            __syncwarp();
+        } else {
+            // With row statistics the whole warp runs the loop: a Q stage is recycled only after
+            // the math warps released it (`empty_q`), which also publishes their statistics
+            // partials for the block that used the stage. The warp sums those partials and
+            // issues one coalesced reduction per row right before refilling the stage, so no
+            // extra barrier or wait is needed; the last stages are drained after the loop.
             auto scheduler = make_scheduler(kReuseSchedulerIndex ? sm_idx : uint32_t(blockIdx.x));
+            // Register ring of the in-flight blocks' (row base, valid tokens), newest first;
+            // shifted with constant indices so it never touches local memory
+            uint32_t ring_row_base[kNumQStages], ring_num_tokens[kNumQStages];
+            #pragma unroll
+            for (uint32_t k = 0; k < kNumQStages; ++ k)
+                ring_row_base[k] = ring_num_tokens[k] = 0;
+            uint32_t num_issued = 0;
+
+            const auto consume_stats = [&](const uint32_t& q_stage_idx, const uint32_t& row_base,
+                                           const uint32_t& num_block_tokens) {
+                // Lane `l` owns (token `l / 2`, statistic `l % 2`); adjacent lanes hit adjacent words
+                #pragma unroll
+                for (uint32_t base = 0; base < 2 * BLOCK_Q; base += 32) {
+                    const uint32_t item = base + lane_idx;
+                    const uint32_t token_idx = item / 2;
+                    if (token_idx < num_block_tokens) {
+                        float acc = 0.0f;
+                        #pragma unroll
+                        for (uint32_t w = 0; w < kNumMathWarps; ++ w) {
+                            const auto partial = row_stats_smem.partials[q_stage_idx][w][token_idx];
+                            acc += (item & 1) ? partial.y : partial.x;
+                        }
+                        const uint32_t row = row_base + token_idx;
+                        if (row < num_row_stats_rows)
+                            atomicAdd(row_stats + row * row_stats_stride + (item & 1), acc);
+                    }
+                }
+                __syncwarp();
+            };
+
             // NOTES: split index for paged scheduler, token offset for contiguous-KV scheduler.
             uint32_t q_block_idx, kv_base, num_kv_splits;
             while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
                 CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
+                // Acquire the math warps' release of this stage (all lanes poll the same barrier).
+                // Consume the recycled stage's partials before refilling it: the math warps can
+                // only rewrite this slot after `full_q` of the block issued below, so the order
+                // read-partials -> TMA -> (block N+3) -> write-partials is guaranteed by the Q pipeline.
                 smem.empty_q_barriers[q_stage_idx].wait(q_phase ^ 1);
+                if (num_issued >= kNumQStages)
+                    consume_stats(q_stage_idx, ring_row_base[kNumQStages - 1], ring_num_tokens[kNumQStages - 1]);
 
-                const uint32_t q_token_base = scheduler.get_q_tma_token_base(q_block_idx);
-                tma::copy<kHeadDim, BLOCK_Q * kNumHeads, 0>(
-                    &tensor_map_q, &smem.full_q_barriers[q_stage_idx],
-                    smem.smem_q[q_stage_idx], 0, q_token_base * kNumHeads);
-                if constexpr (kIsMXSF)
-                    tma::copy<BLOCK_Q * kNumHeads, 1, 0>(&tensor_map_sf_q, &smem.full_q_barriers[q_stage_idx], smem.smem_sf_q[q_stage_idx], 0, q_token_base);
-                tma::copy<kNumWeightElementsPerRow, BLOCK_Q, 0>(&tensor_map_weights, &smem.full_q_barriers[q_stage_idx], smem.smem_weights[q_stage_idx], 0, q_token_base);
-                smem.full_q_barriers[q_stage_idx].arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE + SMEM_SF_Q_SIZE_PER_STAGE + SMEM_WEIGHT_SIZE_PER_STAGE);
+                if (cute::elect_one_sync()) {
+                    const uint32_t q_token_base = scheduler.get_q_tma_token_base(q_block_idx);
+                    tma::copy<kHeadDim, BLOCK_Q * kNumHeads, 0>(
+                        &tensor_map_q, &smem.full_q_barriers[q_stage_idx],
+                        smem.smem_q[q_stage_idx], 0, q_token_base * kNumHeads);
+                    if constexpr (kIsMXSF)
+                        tma::copy<BLOCK_Q * kNumHeads, 1, 0>(&tensor_map_sf_q, &smem.full_q_barriers[q_stage_idx], smem.smem_sf_q[q_stage_idx], 0, q_token_base);
+                    tma::copy<kNumWeightElementsPerRow, BLOCK_Q, 0>(&tensor_map_weights, &smem.full_q_barriers[q_stage_idx], smem.smem_weights[q_stage_idx], 0, q_token_base);
+                    smem.full_q_barriers[q_stage_idx].arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE + SMEM_SF_Q_SIZE_PER_STAGE + SMEM_WEIGHT_SIZE_PER_STAGE);
+                }
+                __syncwarp();
+
+                // Shift the ring and record this block
+                #pragma unroll
+                for (uint32_t k = kNumQStages - 1; k > 0; -- k) {
+                    ring_row_base[k] = ring_row_base[k - 1];
+                    ring_num_tokens[k] = ring_num_tokens[k - 1];
+                }
+                ring_row_base[0] = scheduler.get_logits_row(q_block_idx, 0);
+                if constexpr (decltype(scheduler)::kHasPartialBlock)
+                    ring_num_tokens[0] = scheduler.get_num_block_tokens(q_block_idx);
+                else
+                    ring_num_tokens[0] = BLOCK_Q;
+                ++ num_issued;
+            }
+
+            // Drain: the last blocks have no refill to trigger their consumption. The next
+            // `kNumQStages` pipeline positions correspond to blocks `num_issued - kNumQStages` to
+            // `num_issued - 1` in order (ring entries oldest to newest); skip the positions of
+            // blocks that never existed.
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumQStages; ++ i) {
+                CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
+                if (i + num_issued < kNumQStages)
+                    continue;
+                smem.empty_q_barriers[q_stage_idx].wait(q_phase ^ 1);
+                consume_stats(q_stage_idx, ring_row_base[kNumQStages - 1 - i], ring_num_tokens[kNumQStages - 1 - i]);
             }
         }
-        __syncwarp();
     } else if (warp_idx == kSpecWarpStart + 1) {
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
 
@@ -412,7 +510,8 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     } else if (warp_idx < kSpecWarpStart) {
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
-        constexpr bool kLoadSeqBounds = kIsCompressedLogits or kCleanLogits;
+        // Row statistics must only count logits inside each row's valid KV range
+        constexpr bool kLoadSeqBounds = kIsCompressedLogits or kCleanLogits or kRowStats;
         uint32_t seq_k_start[kLoadSeqBounds ? BLOCK_Q : 1];
         uint32_t seq_k_end[kLoadSeqBounds ? BLOCK_Q : 1];
         const auto local_math_warp_idx = get_mqa_math_warp_idx<kPagedWideLoad>(warp_idx);
@@ -466,6 +565,22 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                 if constexpr (kFenceWeightsEarly)
                     cutlass::arch::fence_view_async_shared();
 
+                // Per-thread FP32 row statistics partials `(sum, sqr_sum)` over all KV splits of
+                // this Q block. The MX reduction runs on packed F32x2 math and a scalar FFMA in
+                // that loop derails its scheduling (+10%), so MX updates with one packed FFMA2;
+                // the FP8 reduction measures slightly faster with the scalar FADD + FFMA pair
+                constexpr uint32_t kNumRowStatsRegs = kRowStats ? kNumValidTokens : 1;
+                constexpr bool kRowStatsPackedUpdate = kIsMXSF;
+                float2 row_acc[kNumRowStatsRegs];
+                if constexpr (kRowStats) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumValidTokens; ++ i)
+                        row_acc[i] = make_float2(0.0f, 0.0f);
+                }
+
+                // One KV split per iteration: unrolling this loop clusters the bf16 conversions
+                // away from the FMAs, which costs far more than the saved loop overhead
+                #pragma unroll 1
                 for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++ kv_split_idx) {
                     auto kv_offset = scheduler.get_logits_col(kv_base, kv_split_idx, math_thread_idx);
 
@@ -573,6 +688,33 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                         } else {
                             logits[q_offset + kv_offset] = result;
                         }
+
+                        if constexpr (kRowStats) {
+                            // Statistics follow the stored (rounded) logits; only the row's valid
+                            // columns count. The branch form lets the compiler predicate both updates.
+                            const uint32_t rel_kv = kv_offset - seq_k_start[i];
+                            const uint32_t len = seq_k_end[i] - seq_k_start[i];
+                            if (rel_kv < len) {
+                                const float value = static_cast<float>(result);
+                                if constexpr (kRowStatsPackedUpdate) {
+                                    row_acc[i] = __ffma2_rn(make_float2(value, value), make_float2(1.0f, value), row_acc[i]);
+                                } else {
+                                    row_acc[i].x += value;
+                                    row_acc[i].y = fmaf(value, value, row_acc[i].y);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // One warp reduction per (warp, row) per Q block; the partials are published to
+                // shared memory and ordered by this block's `empty_q` release-arrive below. The
+                // Q producer sums them right before it recycles the stage.
+                if constexpr (kRowStats) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
+                        epilogue::warp_publish_row_stats(&row_stats_smem.partials[q_stage_idx][local_math_warp_idx][i],
+                                                         lane_idx, row_acc[i].x, row_acc[i].y);
                     }
                 }
             };
@@ -595,7 +737,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
 // Unified contiguous-KV entry for FP8 / MXFP4 / MXFP8.
 template <uint32_t kNumHeads, uint32_t kHeadDim,
-          bool kIsMXSF, bool kIsCompressedLogits, bool kCleanLogits,
+          bool kIsMXSF, bool kIsCompressedLogits, bool kCleanLogits, bool kRowStats,
           bool kUseSchedule,
           uint32_t BLOCK_Q, uint32_t SPLIT_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
@@ -610,6 +752,7 @@ void sm100_mqa_logits(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
                       const uint32_t* cu_seq_len_k_end,
                       const uint32_t* schedule_meta,
                       logits_dtype_t* logits,
+                      float* row_stats, const uint32_t row_stats_stride,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
@@ -620,12 +763,12 @@ void sm100_mqa_logits(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
             sm_idx, num_q_tokens, num_kv_tokens, cu_seq_len_k_start, cu_seq_len_k_end, schedule_meta);
     };
 
-    sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, kIsCompressedLogits, kCleanLogits,
+    sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, kIsCompressedLogits, kCleanLogits, kRowStats,
                                BLOCK_Q, SPLIT_KV,
                                kNumQStages, kNumKVStages, kNumSMs,
                                kNumSpecializedThreads, kNumMathThreads, qk_dtype_t, logits_dtype_t,
                                reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups>(
-        logits_stride, logits,
+        logits_stride, logits, row_stats, row_stats_stride, num_q_tokens,
         tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv, tensor_map_weights,
         make_scheduler);
 }
@@ -633,7 +776,7 @@ void sm100_mqa_logits(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
 // Long H8/BF16 reduction benefits from the original fully unrolled span scan.
 // A separate entry preserves the default kernel symbol and codegen for other modes.
 template <uint32_t kNumHeads, uint32_t kHeadDim,
-          bool kIsMXSF, bool kIsCompressedLogits, bool kCleanLogits,
+          bool kIsMXSF, bool kIsCompressedLogits, bool kCleanLogits, bool kRowStats,
           bool kUseSchedule,
           uint32_t BLOCK_Q, uint32_t SPLIT_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
@@ -648,6 +791,7 @@ void sm100_mqa_logits_unrolled(const uint32_t num_q_tokens, const uint32_t num_k
                       const uint32_t* cu_seq_len_k_end,
                       const uint32_t* schedule_meta,
                       logits_dtype_t* logits,
+                      float* row_stats, const uint32_t row_stats_stride,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
@@ -663,12 +807,12 @@ void sm100_mqa_logits_unrolled(const uint32_t num_q_tokens, const uint32_t num_k
             sm_idx, num_q_tokens, num_kv_tokens, cu_seq_len_k_start, cu_seq_len_k_end, schedule_meta);
     };
 
-    sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, kIsCompressedLogits, kCleanLogits,
+    sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, kIsCompressedLogits, kCleanLogits, kRowStats,
                                BLOCK_Q, SPLIT_KV,
                                kNumQStages, kNumKVStages, kNumSMs,
                                kNumSpecializedThreads, kNumMathThreads, qk_dtype_t, logits_dtype_t,
                                reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups>(
-        logits_stride, logits,
+        logits_stride, logits, row_stats, row_stats_stride, num_q_tokens,
         tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv, tensor_map_weights,
         make_scheduler);
 }
@@ -677,7 +821,7 @@ void sm100_mqa_logits_unrolled(const uint32_t num_q_tokens, const uint32_t num_k
 // Paged scheduler walks (Q-block, chunk) tasks.
 template <uint32_t kTokensPerRequest, uint32_t kNumHeads,
           uint32_t kHeadDim, uint32_t PAGE_KV,
-          bool kIsMXSF, bool kIsContextLens2D, bool kIsVarlen,
+          bool kIsMXSF, bool kIsContextLens2D, bool kIsVarlen, bool kRowStats,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t SPLIT_KV, uint32_t kSplitsPerChunk,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
@@ -687,6 +831,7 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1)
 void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
                             const uint32_t logits_stride, const uint32_t block_table_stride,
                             const uint32_t* context_lens, logits_dtype_t* logits,
+                            float* row_stats, const uint32_t row_stats_stride,
                             const uint32_t* block_table, const uint32_t* indices,
                             const uint32_t* schedule_meta,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_q,
@@ -706,12 +851,12 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
     };
 
     // Paged uses `kNumSMs = 0`; schedule meta drives the grid stride
-    sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, false, false,
+    sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, false, false, kRowStats,
                                BLOCK_Q, SPLIT_KV,
                                kNumQStages, kNumKVStages, 0,
                                kNumSpecializedThreads, kNumMathThreads, qk_dtype_t, logits_dtype_t,
                                reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups>(
-        logits_stride, logits,
+        logits_stride, logits, row_stats, row_stats_stride, num_q_tokens_total,
         tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv, tensor_map_weights,
         make_scheduler);
 }
